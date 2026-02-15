@@ -1,0 +1,7 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+withoutbg==1.0.2
+python-multipart==0.0.20
+pillow>=11.0.0
+pillow-avif-plugin>=1.4.0
+cairosvg>=2.7.0
