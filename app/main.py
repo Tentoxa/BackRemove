@@ -5,6 +5,7 @@ import logging
 from contextlib import asynccontextmanager
 
 import anyio
+from anyio.abc import TaskStatus
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -52,6 +53,22 @@ def _get_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _cleanup_expired_entries():
+    """Remove all expired entries from rate-limiting dicts to prevent unbounded growth."""
+    now = time.monotonic()
+    expired_blocked = [ip for ip, ts in _blocked_ips.items() if now - ts >= BLOCK_DURATION]
+    for ip in expired_blocked:
+        del _blocked_ips[ip]
+        _failed_attempts.pop(ip, None)
+
+    expired_attempts = [
+        ip for ip, attempts in _failed_attempts.items()
+        if not any(now - t < ATTEMPT_WINDOW for t in attempts)
+    ]
+    for ip in expired_attempts:
+        del _failed_attempts[ip]
+
+
 def _is_blocked(ip: str) -> bool:
     if ip in _blocked_ips:
         if time.monotonic() - _blocked_ips[ip] < BLOCK_DURATION:
@@ -87,10 +104,23 @@ async def verify_api_key(request: Request, key: str = Security(api_key_header)):
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
 
+CLEANUP_INTERVAL = 300  # seconds between rate-limit cleanup sweeps
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_model()
-    yield
+
+    async def _periodic_cleanup(*, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED):
+        task_status.started()
+        while True:
+            await anyio.sleep(CLEANUP_INTERVAL)
+            _cleanup_expired_entries()
+
+    async with anyio.create_task_group() as tg:
+        await tg.start(_periodic_cleanup)
+        yield
+        tg.cancel_scope.cancel()
 
 
 app = FastAPI(title="BackRemove", version="1.0.0", lifespan=lifespan)
@@ -106,18 +136,34 @@ if CORS_ORIGINS:
 
 def _process_image(image_bytes: bytes, content_type: str) -> bytes:
     model = get_model()
+    input_image = None
+    result = None
+    buf = None
 
-    if content_type == "image/svg+xml":
-        import cairosvg
-        png_data = cairosvg.svg2png(bytestring=image_bytes)
-        input_image = Image.open(io.BytesIO(png_data)).convert("RGB")
-    else:
-        input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    try:
+        if content_type == "image/svg+xml":
+            import cairosvg
+            png_data = cairosvg.svg2png(bytestring=image_bytes)
+            src = io.BytesIO(png_data)
+        else:
+            src = io.BytesIO(image_bytes)
 
-    result = model.remove_background(input_image)
-    buf = io.BytesIO()
-    result.save(buf, format="PNG")
-    return buf.getvalue()
+        try:
+            input_image = Image.open(src).convert("RGB")
+        finally:
+            src.close()
+
+        result = model.remove_background(input_image)
+        buf = io.BytesIO()
+        result.save(buf, format="PNG")
+        return buf.getvalue()
+    finally:
+        if input_image is not None:
+            input_image.close()
+        if result is not None:
+            result.close()
+        if buf is not None:
+            buf.close()
 
 
 @app.get("/health")
@@ -144,11 +190,13 @@ async def remove_bg(request: Request, file: UploadFile = File(...)):
             raise HTTPException(status_code=413, detail="File too large. Max 20 MB.")
         chunks.append(chunk)
     image_bytes = b"".join(chunks)
+    del chunks  # free list of chunk references early
 
     try:
         with anyio.fail_after(INFERENCE_TIMEOUT):
+            content_type = file.content_type or ""
             result_bytes = await anyio.to_thread.run_sync(
-                lambda: _process_image(image_bytes, file.content_type or "")
+                lambda: _process_image(image_bytes, content_type)
             )
     except TimeoutError:
         logger.error(f"Inference timed out after {INFERENCE_TIMEOUT}s")
@@ -156,6 +204,8 @@ async def remove_bg(request: Request, file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Inference failed: {e}")
         raise HTTPException(status_code=500, detail="Background removal failed.")
+    finally:
+        del image_bytes  # free input bytes after processing
 
     return StreamingResponse(
         io.BytesIO(result_bytes),
