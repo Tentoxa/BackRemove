@@ -1,21 +1,44 @@
 # BackRemove
 
-Background removal API using [WithoutBG](https://github.com/withoutbg/withoutbg) Focus.
+Background removal API using the withoutBG Open Weights model.
 
-## Setup
+## Native setup (Windows + NVIDIA GPU)
 
-```bash
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8080
+Requires Python 3.12 and a current NVIDIA driver. Double-click
+`start-gpu.bat`; it installs/checks the Pascal-compatible CUDA 11 and cuDNN 8
+runtime in `.venv` and then starts the API. A system-wide CUDA toolkit is not
+required.
+
+```bat
+start-gpu.bat
 ```
 
-Or with Docker:
+The first server start downloads the model (~495 MB) and creates a CUDA-compatible
+copy in the model cache. Confirm that inference is really using the GPU:
+
+```powershell
+Invoke-RestMethod http://localhost:8080/health
+# status: ok
+# inference_provider: CUDAExecutionProvider
+```
+
+`INFERENCE_DEVICE` accepts `cuda`, `cpu`, or `auto` (the default). Explicit
+`cuda` fails at startup instead of silently running on the CPU.
+
+## Native CPU setup
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+$env:INFERENCE_DEVICE = "cpu"
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8080
+```
+
+## Docker
 
 ```bash
 docker compose up --build
 ```
-
-Model weights (~320 MB) are downloaded automatically on first start.
 
 ## Usage
 

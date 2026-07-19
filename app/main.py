@@ -17,7 +17,7 @@ try:
 except ImportError:
     pass
 
-from app.model import load_model, get_model
+from app.model import get_inference_provider, get_model, load_model
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -168,7 +168,10 @@ def _process_image(image_bytes: bytes, content_type: str) -> bytes:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "inference_provider": get_inference_provider(),
+    }
 
 
 @app.post("/remove-bg", dependencies=[Security(verify_api_key)])
