@@ -13,15 +13,32 @@ from app.inference import (
     InferenceQueueFullError,
     InferenceQueueTimeoutError,
     InvalidImageError,
-    process_image,
+    decode_image,
 )
 from app.model import ModelName
+
+
+class _FakeImage:
+    def __init__(self, payload):
+        self.payload = payload
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _decode_fake(image_bytes, content_type):
+    return _FakeImage(image_bytes)
+
+
+def _encode_fake(result):
+    return result.payload
 
 
 class ImageProcessingTests(unittest.TestCase):
     def test_invalid_image_data_is_rejected(self):
         with self.assertRaises(InvalidImageError):
-            process_image(b"not an image", "image/png", ModelName.FAST)
+            decode_image(b"not an image", "image/png")
 
     def test_decoded_pixel_limit_is_enforced_before_inference(self):
         source = Image.new("RGB", (2, 2))
@@ -37,7 +54,7 @@ class ImageProcessingTests(unittest.TestCase):
             patch("app.inference.MAX_IMAGE_PIXELS", 1),
             self.assertRaises(InvalidImageError),
         ):
-            process_image(image_bytes, "image/png", ModelName.FAST)
+            decode_image(image_bytes, "image/png")
 
 
 class GpuInferenceServiceTests(unittest.TestCase):
@@ -47,7 +64,7 @@ class GpuInferenceServiceTests(unittest.TestCase):
         observed_models = []
         state_lock = threading.Lock()
 
-        def processor(image_bytes, content_type, model):
+        def processor(input_image, model):
             nonlocal active, max_active
             with state_lock:
                 active += 1
@@ -56,11 +73,15 @@ class GpuInferenceServiceTests(unittest.TestCase):
             time.sleep(0.03)
             with state_lock:
                 active -= 1
-            return image_bytes + model.value.encode("ascii")
+            return _FakeImage(
+                input_image.payload + model.value.encode("ascii")
+            )
 
         async def scenario():
             service = GpuInferenceService(
+                decoder=_decode_fake,
                 processor=processor,
+                encoder=_encode_fake,
                 preloader=lambda: None,
                 queue_capacity=4,
                 queue_timeout=1.0,
@@ -95,14 +116,16 @@ class GpuInferenceServiceTests(unittest.TestCase):
         processor_started = threading.Event()
         release_processor = threading.Event()
 
-        def processor(image_bytes, content_type, model):
+        def processor(input_image, model):
             processor_started.set()
             release_processor.wait(timeout=2.0)
-            return image_bytes
+            return _FakeImage(input_image.payload)
 
         async def scenario():
             service = GpuInferenceService(
+                decoder=_decode_fake,
                 processor=processor,
+                encoder=_encode_fake,
                 preloader=lambda: None,
                 queue_capacity=1,
                 queue_timeout=1.0,
@@ -143,15 +166,17 @@ class GpuInferenceServiceTests(unittest.TestCase):
         release_first = threading.Event()
         executions = []
 
-        def processor(image_bytes, content_type, model):
-            executions.append(image_bytes)
+        def processor(input_image, model):
+            executions.append(input_image.payload)
             first_started.set()
             release_first.wait(timeout=2.0)
-            return image_bytes
+            return _FakeImage(input_image.payload)
 
         async def scenario():
             service = GpuInferenceService(
+                decoder=_decode_fake,
                 processor=processor,
+                encoder=_encode_fake,
                 preloader=lambda: None,
                 queue_capacity=2,
                 queue_timeout=0.03,
@@ -187,15 +212,17 @@ class GpuInferenceServiceTests(unittest.TestCase):
         release_first = threading.Event()
         executions = []
 
-        def processor(image_bytes, content_type, model):
-            executions.append(image_bytes)
+        def processor(input_image, model):
+            executions.append(input_image.payload)
             first_started.set()
             release_first.wait(timeout=2.0)
-            return image_bytes
+            return _FakeImage(input_image.payload)
 
         async def scenario():
             service = GpuInferenceService(
+                decoder=_decode_fake,
                 processor=processor,
+                encoder=_encode_fake,
                 preloader=lambda: None,
                 queue_capacity=2,
                 queue_timeout=1.0,
@@ -241,18 +268,79 @@ class GpuInferenceServiceTests(unittest.TestCase):
 
         anyio.run(scenario)
 
-    def test_response_timeout_does_not_release_gpu_slot_early(self):
-        executions = []
+    def test_png_encoding_does_not_hold_gpu_slot(self):
+        first_encode_started = threading.Event()
+        release_first_encode = threading.Event()
+        second_gpu_started = threading.Event()
+        results = [None, None]
 
-        def processor(image_bytes, content_type, model):
-            executions.append(("start", image_bytes))
-            time.sleep(0.08)
-            executions.append(("end", image_bytes))
-            return image_bytes
+        def processor(input_image, model):
+            if input_image.payload == b"second":
+                second_gpu_started.set()
+            return _FakeImage(input_image.payload)
+
+        def encoder(result):
+            if result.payload == b"first":
+                first_encode_started.set()
+                release_first_encode.wait(timeout=2.0)
+            return result.payload
 
         async def scenario():
             service = GpuInferenceService(
+                decoder=_decode_fake,
                 processor=processor,
+                encoder=encoder,
+                preloader=lambda: None,
+                queue_capacity=2,
+                queue_timeout=1.0,
+                inference_timeout=1.0,
+                proxy_budget=3.0,
+            )
+
+            async def submit(index, payload):
+                results[index] = await service.infer(
+                    payload,
+                    "image/png",
+                    ModelName.FAST,
+                )
+
+            async with anyio.create_task_group() as service_tasks:
+                await service_tasks.start(service.run)
+                async with anyio.create_task_group() as jobs:
+                    jobs.start_soon(submit, 0, b"first")
+                    while not first_encode_started.is_set():
+                        await anyio.sleep(0.005)
+                    jobs.start_soon(submit, 1, b"second")
+                    with anyio.fail_after(0.5):
+                        while not second_gpu_started.is_set():
+                            await anyio.sleep(0.005)
+                    release_first_encode.set()
+                service_tasks.cancel_scope.cancel()
+
+            self.assertEqual(
+                [result.image_bytes for result in results],
+                [b"first", b"second"],
+            )
+
+        anyio.run(scenario)
+
+    def test_response_timeout_does_not_release_gpu_slot_early(self):
+        executions = []
+        produced = []
+
+        def processor(input_image, model):
+            executions.append(("start", input_image.payload))
+            time.sleep(0.08)
+            executions.append(("end", input_image.payload))
+            result = _FakeImage(input_image.payload)
+            produced.append(result)
+            return result
+
+        async def scenario():
+            service = GpuInferenceService(
+                decoder=_decode_fake,
+                processor=processor,
+                encoder=_encode_fake,
                 preloader=lambda: None,
                 queue_capacity=2,
                 queue_timeout=0.5,
@@ -268,6 +356,7 @@ class GpuInferenceServiceTests(unittest.TestCase):
                 while service.status()["busy"]:
                     await anyio.sleep(0.01)
                 self.assertEqual(executions, [("start", b"slow"), ("end", b"slow")])
+                self.assertTrue(produced[0].closed)
                 service_tasks.cancel_scope.cancel()
 
         anyio.run(scenario)

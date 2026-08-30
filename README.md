@@ -73,8 +73,9 @@ curl -X POST "http://localhost:8080/remove-bg?model=quality" \
   --output no-bg-quality.png
 ```
 
-Responses expose `X-Model-Used`, `X-Queue-Time-Ms`, and
-`X-Inference-Time-Ms`. Supported formats: JPEG, PNG, WebP, GIF, AVIF, SVG.
+Responses expose `X-Model-Used`, `X-Queue-Time-Ms`, `X-Decode-Time-Ms`,
+`X-Inference-Time-Ms`, and `X-Encode-Time-Ms`. Supported formats: JPEG, PNG,
+WebP, GIF, AVIF, SVG.
 Uploads are limited to 20 MB and 40 million decoded pixels; malformed image
 data is rejected before inference.
 PNG output uses compression level 3 to favor encode latency over minimum
@@ -82,11 +83,12 @@ response size.
 
 ## GPU admission control
 
-One bounded GPU actor serializes inference across both models. Requests never
-run concurrently on the GPU. A full or expired queue returns `503` with
-`Retry-After`; an inference response deadline returns `504`. Queue waiting and
-execution have separate deadlines whose sum stays below the reverse-proxy
-budget.
+A bounded pipeline decodes uploads before GPU admission and encodes PNG output
+after inference. One GPU actor serializes only the model call across both
+models, so the next request can use the GPU while the previous result is being
+encoded. A full or expired queue returns `503` with `Retry-After`; an inference
+response deadline returns `504`. Queue waiting and model execution have
+separate deadlines whose sum stays below the reverse-proxy budget.
 
 When the quality backend is enabled, startup warms both models before the API
 reports ready. This removes first-request latency and prevents a cold model load
