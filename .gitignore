@@ -1,24 +1,49 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
-dist/
-build/
 .eggs/
+build/
+dist/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 
+# Virtual environments and local configuration
 .env
+.env.*
+!.env.example
 .venv/
 venv/
 env/
 
+# Model weights and caches
 *.onnx
 *.pt
 *.pth
+*.safetensors
+*.ckpt
+*.engine
+*.plan
 .cache/
 
+# Editors and operating systems
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
+.DS_Store
+Thumbs.db
+Desktop.ini
 
+# Local secrets and runtime output
+*.pem
+*.key
+*.p12
+*.pfx
 *.log
+logs/

@@ -2,10 +2,12 @@ import ctypes
 import logging
 import os
 import site
+from enum import Enum
 from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
+from PIL import Image
 from withoutbg import WithoutBG
 from withoutbg.models import OpenWeightsModel
 
@@ -14,8 +16,23 @@ logger = logging.getLogger(__name__)
 CUDA_PROVIDER = "CUDAExecutionProvider"
 CPU_PROVIDER = "CPUExecutionProvider"
 VALID_DEVICES = {"auto", "cpu", "cuda"}
+BIREFNET_REPOSITORY = "ZhengPeng7/BiRefNet"
+BIREFNET_REVISION = "e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4"
+BIREFNET_INPUT_SIZE = 1024
+
+
+class ModelName(str, Enum):
+    FAST = "fast"
+    QUALITY = "quality"
+
+
+class ModelUnavailableError(RuntimeError):
+    pass
+
 
 _model = None
+_quality_model = None
+_quality_preprocess = None
 _inference_provider = "unloaded"
 _dll_directory_handles = []
 _cuda_dll_handles = []
@@ -34,9 +51,7 @@ def _prepare_cuda_runtime() -> None:
                 [*(str(path) for path in dll_dirs), os.environ.get("PATH", "")]
             )
             for dll_dir in dll_dirs:
-                _dll_directory_handles.append(
-                    os.add_dll_directory(str(dll_dir))
-                )
+                _dll_directory_handles.append(os.add_dll_directory(str(dll_dir)))
 
             for dll_dir in dll_dirs:
                 if dll_dir.parent.name != "cudnn":
@@ -133,7 +148,12 @@ class _CudaOpenWeightsModel(OpenWeightsModel):
         cuda_model_path = _prepare_model_for_cuda(self.model_path)
         self.session = ort.InferenceSession(
             str(cuda_model_path),
-            providers=[CUDA_PROVIDER],
+            providers=[
+                (
+                    CUDA_PROVIDER,
+                    {"arena_extend_strategy": "kSameAsRequested"},
+                )
+            ],
         )
         self.session.disable_fallback()
         canvas_size = int(self.sidecar.get("canvas_size", 448))
@@ -149,9 +169,7 @@ class _CudaOpenWeightsModel(OpenWeightsModel):
         )
         active_provider = self.session.get_providers()[0]
         if active_provider != CUDA_PROVIDER:
-            raise RuntimeError(
-                f"Expected {CUDA_PROVIDER}, got {active_provider}."
-            )
+            raise RuntimeError(f"Expected {CUDA_PROVIDER}, got {active_provider}.")
 
 
 def _load_cpu_model():
@@ -172,10 +190,9 @@ def load_model():
             f"expected one of {sorted(VALID_DEVICES)}."
         )
 
-    logger.info("Loading model (requested device: %s)...", requested_device)
+    logger.info("Loading fast model (requested device: %s)...", requested_device)
     use_cuda = requested_device == "cuda" or (
-        requested_device == "auto"
-        and CUDA_PROVIDER in ort.get_available_providers()
+        requested_device == "auto" and CUDA_PROVIDER in ort.get_available_providers()
     )
 
     if use_cuda:
@@ -197,15 +214,173 @@ def load_model():
         _model = _load_cpu_model()
         _inference_provider = CPU_PROVIDER
 
-    logger.info("Model ready (provider: %s).", _inference_provider)
+    logger.info("Fast model ready (provider: %s).", _inference_provider)
     return _model
 
 
-def get_model():
+def _get_fast_model():
     if _model is None:
-        raise RuntimeError("Model not loaded.")
+        raise RuntimeError("Fast model not loaded.")
     return _model
+
+
+def _quality_enabled() -> bool:
+    return os.environ.get("QUALITY_MODEL_ENABLED", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def load_quality_model():
+    global _quality_model, _quality_preprocess
+    if _quality_model is not None:
+        return _quality_model
+    if not _quality_enabled():
+        raise ModelUnavailableError("The quality model is disabled on this deployment.")
+    if os.environ.get("INFERENCE_DEVICE", "auto").lower() != "cuda":
+        raise ModelUnavailableError("The quality model requires INFERENCE_DEVICE=cuda.")
+
+    try:
+        import torch
+        from torchvision import transforms
+        from transformers import AutoModelForImageSegmentation
+    except ImportError as exc:
+        raise ModelUnavailableError(
+            "The quality model dependencies are not installed."
+        ) from exc
+
+    if not torch.cuda.is_available():
+        raise ModelUnavailableError("PyTorch CUDA is unavailable.")
+
+    logger.info(
+        "Loading quality model %s at revision %s...",
+        BIREFNET_REPOSITORY,
+        BIREFNET_REVISION,
+    )
+    try:
+        model = AutoModelForImageSegmentation.from_pretrained(
+            BIREFNET_REPOSITORY,
+            revision=BIREFNET_REVISION,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        model = model.to("cuda").eval().half()
+        preprocess = transforms.Compose(
+            [
+                transforms.Resize((BIREFNET_INPUT_SIZE, BIREFNET_INPUT_SIZE)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    [0.485, 0.456, 0.406],
+                    [0.229, 0.224, 0.225],
+                ),
+            ]
+        )
+        with torch.inference_mode():
+            model(
+                torch.zeros(
+                    (1, 3, BIREFNET_INPUT_SIZE, BIREFNET_INPUT_SIZE),
+                    device="cuda",
+                    dtype=torch.float16,
+                )
+            )[-1].sigmoid()
+        torch.cuda.synchronize()
+    except torch.cuda.OutOfMemoryError as exc:
+        model = None
+        torch.cuda.empty_cache()
+        raise ModelUnavailableError(
+            "Insufficient GPU memory to load the quality model."
+        ) from exc
+    except OSError as exc:
+        model = None
+        raise ModelUnavailableError(
+            "The pinned quality model is not cached. Run setup-gpu.ps1."
+        ) from exc
+
+    _quality_model = model
+    _quality_preprocess = preprocess
+    logger.info("Quality model ready (PyTorch CUDA, FP16).")
+    return _quality_model
+
+
+def load_enabled_models() -> None:
+    load_model()
+    if _quality_enabled():
+        load_quality_model()
+
+
+def _remove_with_quality_model(input_image: Image.Image) -> Image.Image:
+    model = load_quality_model()
+    if _quality_preprocess is None:
+        raise RuntimeError("Quality model preprocessing is unavailable.")
+
+    import torch
+
+    try:
+        tensor = (
+            _quality_preprocess(input_image)
+            .unsqueeze(0)
+            .to(device="cuda", dtype=torch.float16)
+        )
+        with torch.inference_mode():
+            prediction = model(tensor)[-1].sigmoid()[0, 0]
+            mask_array = prediction.float().cpu().numpy()
+        del tensor, prediction
+    except torch.cuda.OutOfMemoryError as exc:
+        # Drop CUDA references before releasing unused cached blocks.
+        tensor = None  # noqa: F841
+        prediction = None  # noqa: F841
+        torch.cuda.empty_cache()
+        raise ModelUnavailableError(
+            "Insufficient GPU memory to run the quality model."
+        ) from exc
+
+    mask = Image.fromarray(np.clip(mask_array * 255.0, 0, 255).astype(np.uint8))
+    try:
+        resized_mask = mask.resize(input_image.size, Image.Resampling.BILINEAR)
+    finally:
+        mask.close()
+    result = input_image.copy()
+    try:
+        result.putalpha(resized_mask)
+    except Exception:
+        result.close()
+        raise
+    finally:
+        resized_mask.close()
+    return result
+
+
+def remove_background(
+    input_image: Image.Image,
+    model_name: ModelName,
+) -> Image.Image:
+    if model_name is ModelName.FAST:
+        return _get_fast_model().remove_background(input_image)
+    if model_name is ModelName.QUALITY:
+        return _remove_with_quality_model(input_image)
+    raise ValueError(f"Unsupported model: {model_name!r}")
 
 
 def get_inference_provider() -> str:
     return _inference_provider
+
+
+def get_model_status() -> dict[str, dict[str, object]]:
+    return {
+        ModelName.FAST.value: {
+            "loaded": _model is not None,
+            "provider": _inference_provider,
+            "runtime": "onnxruntime",
+        },
+        ModelName.QUALITY.value: {
+            "enabled": _quality_enabled(),
+            "loaded": _quality_model is not None,
+            "provider": CUDA_PROVIDER if _quality_model is not None else None,
+            "runtime": "pytorch",
+            "precision": "fp16",
+            "repository": BIREFNET_REPOSITORY,
+            "revision": BIREFNET_REVISION,
+        },
+    }

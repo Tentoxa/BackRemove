@@ -1,25 +1,28 @@
 # BackRemove
 
-Background removal API using the withoutBG Open Weights model.
+Background removal API with a fast withoutBG v10 backend and an opt-in
+BiRefNet quality backend.
 
 ## Native setup (Windows + NVIDIA GPU)
 
 Requires Python 3.12 and a current NVIDIA driver. Double-click
-`start-gpu.bat`; it installs/checks the Pascal-compatible CUDA 11 and cuDNN 8
-runtime in `.venv` and then starts the API. A system-wide CUDA toolkit is not
-required.
+`start-gpu.bat`; it installs/checks the Pascal-compatible CUDA 11, cuDNN 8,
+ONNX Runtime, and PyTorch runtimes in `.venv`, caches the pinned model weights,
+and starts the API. A system-wide CUDA toolkit is not required.
 
 ```bat
 start-gpu.bat
 ```
 
-The first server start downloads the model (~495 MB) and creates a CUDA-compatible
-copy in the model cache. Confirm that inference is really using the GPU:
+The first setup downloads both model weights. Confirm that both backends are
+preloaded before readiness and that the serialized GPU queue is active:
 
 ```powershell
 Invoke-RestMethod http://localhost:8080/health
 # status: ok
-# inference_provider: CUDAExecutionProvider
+# models.fast.loaded: true
+# models.quality.loaded: true
+# gpu_queue.capacity: 8
 ```
 
 `INFERENCE_DEVICE` accepts `cuda`, `cpu`, or `auto` (the default). Explicit
@@ -31,8 +34,12 @@ Invoke-RestMethod http://localhost:8080/health
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 $env:INFERENCE_DEVICE = "cpu"
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8080
+$env:API_KEY = "<strong random key>"
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8080 --no-proxy-headers
 ```
+
+The CPU setup exposes only the `fast` backend. `quality` requires the native
+GPU setup.
 
 ## Docker
 
@@ -40,28 +47,68 @@ $env:INFERENCE_DEVICE = "cpu"
 docker compose up --build
 ```
 
+Compose reads `API_KEY` from the local `.env` file and stops with an error if
+the value is missing.
+
+The Docker image exposes only the `fast` backend. The BiRefNet quality runtime
+is installed by `setup-gpu.ps1` for the native NVIDIA deployment.
+
 ## Usage
 
+Fast removal is the default:
+
 ```bash
-curl -X POST http://localhost:8080/remove-bg \
+curl -X POST "http://localhost:8080/remove-bg?model=fast" \
+  -H "X-API-Key: <value from .env>" \
   -F "file=@photo.jpg" \
   --output no-bg.png
 ```
 
-Supported formats: JPEG, PNG, WebP, GIF, AVIF, SVG.
+Retry a difficult image with BiRefNet:
+
+```bash
+curl -X POST "http://localhost:8080/remove-bg?model=quality" \
+  -H "X-API-Key: <value from .env>" \
+  -F "file=@photo.jpg" \
+  --output no-bg-quality.png
+```
+
+Responses expose `X-Model-Used`, `X-Queue-Time-Ms`, and
+`X-Inference-Time-Ms`. Supported formats: JPEG, PNG, WebP, GIF, AVIF, SVG.
+Uploads are limited to 20 MB and 40 million decoded pixels; malformed image
+data is rejected before inference.
+
+## GPU admission control
+
+One bounded GPU actor serializes inference across both models. Requests never
+run concurrently on the GPU. A full or expired queue returns `503` with
+`Retry-After`; an inference response deadline returns `504`. Queue waiting and
+execution have separate deadlines whose sum stays below the reverse-proxy
+budget.
+
+When the quality backend is enabled, startup warms both models before the API
+reports ready. This removes first-request latency and prevents a cold model load
+from consuming the queue deadline.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `GPU_QUEUE_CAPACITY` | `8` | Maximum buffered requests, excluding the active job |
+| `GPU_QUEUE_TIMEOUT` | `10` | Seconds a request may wait to start |
+| `INFERENCE_TIMEOUT` | `75` | Seconds a running job may take before its response expires |
+| `PROXY_REQUEST_BUDGET` | `90` | Upper bound for queue plus inference deadlines |
 
 ## Auth
 
-Optional. Set the `API_KEY` environment variable to require an `X-API-Key` header on requests. Unset = open access.
+`API_KEY` is required. The application refuses to start when it is missing or
+empty. `start-gpu.bat` reads it from the git-ignored `.env` file, and Docker
+Compose passes the same value from `.env` into the container.
 
-```bash
-API_KEY=my-secret uvicorn app.main:app --host 0.0.0.0 --port 8080
-curl -H "X-API-Key: my-secret" -F "file=@photo.jpg" http://localhost:8080/remove-bg --output no-bg.png
-```
+Send the value in the `X-API-Key` header. `/health` remains public for health
+checks.
 
 ## Endpoints
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | GET | `/health` | No | Health check |
-| POST | `/remove-bg` | Optional | Remove background, returns PNG |
+| POST | `/remove-bg?model=fast\|quality` | `X-API-Key` | Remove background, returns PNG |
