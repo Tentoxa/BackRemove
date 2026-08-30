@@ -39,6 +39,7 @@ class InvalidImageError(ValueError):
 class InferenceResult:
     image_bytes: bytes
     model: ModelName
+    admission_ms: float
     queue_ms: float
     decode_ms: float
     inference_ms: float
@@ -58,6 +59,7 @@ class _InferenceJob:
     started_at: float | None = None
     decoded_at: float | None = None
     completed_at: float | None = None
+    admission_ms: float = 0.0
     decode_ms: float = 0.0
     error: Exception | None = None
     cancelled: bool = False
@@ -193,6 +195,9 @@ class GpuInferenceService:
 
                 self._preparing += 1
                 decode_started_at = time.monotonic()
+                job.admission_ms = (
+                    decode_started_at - job.queued_at
+                ) * 1000.0
                 decoded_image = None
                 try:
                     decoded_image = await anyio.to_thread.run_sync(
@@ -428,6 +433,7 @@ class GpuInferenceService:
             return InferenceResult(
                 image_bytes=encoded,
                 model=job.model,
+                admission_ms=job.admission_ms,
                 queue_ms=(job.started_at - job.decoded_at) * 1000.0,
                 decode_ms=job.decode_ms,
                 inference_ms=(job.completed_at - job.started_at) * 1000.0,

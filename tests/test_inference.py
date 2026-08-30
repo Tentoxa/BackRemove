@@ -112,6 +112,54 @@ class GpuInferenceServiceTests(unittest.TestCase):
 
         anyio.run(scenario)
 
+    def test_admission_time_captures_wait_before_decode(self):
+        first_decode_started = threading.Event()
+        release_first_decode = threading.Event()
+        results = [None, None]
+
+        def decoder(image_bytes, content_type):
+            if image_bytes == b"first":
+                first_decode_started.set()
+                release_first_decode.wait(timeout=2.0)
+            return _FakeImage(image_bytes)
+
+        def processor(input_image, model):
+            return _FakeImage(input_image.payload)
+
+        async def scenario():
+            service = GpuInferenceService(
+                decoder=decoder,
+                processor=processor,
+                encoder=_encode_fake,
+                preloader=lambda: None,
+                queue_capacity=2,
+                queue_timeout=1.0,
+                inference_timeout=1.0,
+                proxy_budget=3.0,
+            )
+
+            async def submit(index, payload):
+                results[index] = await service.infer(
+                    payload,
+                    "image/png",
+                    ModelName.FAST,
+                )
+
+            async with anyio.create_task_group() as service_tasks:
+                await service_tasks.start(service.run)
+                async with anyio.create_task_group() as jobs:
+                    jobs.start_soon(submit, 0, b"first")
+                    while not first_decode_started.is_set():
+                        await anyio.sleep(0.005)
+                    jobs.start_soon(submit, 1, b"second")
+                    await anyio.sleep(0.06)
+                    release_first_decode.set()
+                service_tasks.cancel_scope.cancel()
+
+            self.assertGreaterEqual(results[1].admission_ms, 40.0)
+
+        anyio.run(scenario)
+
     def test_full_queue_is_rejected_without_starting_another_gpu_job(self):
         processor_started = threading.Event()
         release_processor = threading.Event()

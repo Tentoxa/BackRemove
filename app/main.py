@@ -256,8 +256,9 @@ async def remove_bg(
         headers={
             "Content-Disposition": "attachment; filename=no-bg.png",
             "X-Model-Used": inference.model.value,
-            "X-Queue-Time-Ms": f"{inference.queue_ms:.1f}",
+            "X-Admission-Time-Ms": f"{inference.admission_ms:.1f}",
             "X-Decode-Time-Ms": f"{inference.decode_ms:.1f}",
+            "X-Queue-Time-Ms": f"{inference.queue_ms:.1f}",
             "X-Inference-Time-Ms": f"{inference.inference_ms:.1f}",
             "X-Encode-Time-Ms": f"{inference.encode_ms:.1f}",
         },

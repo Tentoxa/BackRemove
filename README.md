@@ -73,9 +73,10 @@ curl -X POST "http://localhost:8080/remove-bg?model=quality" \
   --output no-bg-quality.png
 ```
 
-Responses expose `X-Model-Used`, `X-Queue-Time-Ms`, `X-Decode-Time-Ms`,
-`X-Inference-Time-Ms`, and `X-Encode-Time-Ms`. Supported formats: JPEG, PNG,
-WebP, GIF, AVIF, SVG.
+Responses expose `X-Model-Used`, `X-Admission-Time-Ms`, `X-Decode-Time-Ms`,
+`X-Queue-Time-Ms`, `X-Inference-Time-Ms`, and `X-Encode-Time-Ms`. Admission
+measures waiting before decode; queue time measures waiting from decoded input
+to model start. Supported formats: JPEG, PNG, WebP, GIF, AVIF, SVG.
 Uploads are limited to 20 MB and 40 million decoded pixels; malformed image
 data is rejected before inference.
 PNG output uses compression level 3 to favor encode latency over minimum
