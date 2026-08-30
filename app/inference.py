@@ -15,6 +15,7 @@ DEFAULT_QUEUE_TIMEOUT = 10.0
 DEFAULT_INFERENCE_TIMEOUT = 75.0
 DEFAULT_PROXY_BUDGET = 90.0
 MAX_IMAGE_PIXELS = 40_000_000
+PNG_COMPRESSION_LEVEL = 3
 
 
 class InferenceQueueFullError(RuntimeError):
@@ -107,7 +108,11 @@ def process_image(
 
         result = remove_background(input_image, model)
         output = io.BytesIO()
-        result.save(output, format="PNG")
+        result.save(
+            output,
+            format="PNG",
+            compress_level=PNG_COMPRESSION_LEVEL,
+        )
         return output.getvalue()
     finally:
         if input_image is not None:

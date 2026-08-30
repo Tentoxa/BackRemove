@@ -77,6 +77,8 @@ Responses expose `X-Model-Used`, `X-Queue-Time-Ms`, and
 `X-Inference-Time-Ms`. Supported formats: JPEG, PNG, WebP, GIF, AVIF, SVG.
 Uploads are limited to 20 MB and 40 million decoded pixels; malformed image
 data is rejected before inference.
+PNG output uses compression level 3 to favor encode latency over minimum
+response size.
 
 ## GPU admission control
 
