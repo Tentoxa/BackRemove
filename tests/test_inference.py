@@ -324,6 +324,75 @@ class GpuInferenceServiceTests(unittest.TestCase):
 
         anyio.run(scenario)
 
+    def test_encode_capacity_blocks_a_third_gpu_result(self):
+        first_encode_started = threading.Event()
+        second_encode_started = threading.Event()
+        third_gpu_started = threading.Event()
+        release_encoders = threading.Event()
+        results = [None, None, None]
+
+        def processor(input_image, model):
+            if input_image.payload == b"third":
+                third_gpu_started.set()
+            return _FakeImage(input_image.payload)
+
+        def encoder(result):
+            if result.payload == b"first":
+                first_encode_started.set()
+                release_encoders.wait(timeout=2.0)
+            elif result.payload == b"second":
+                second_encode_started.set()
+                release_encoders.wait(timeout=2.0)
+            return result.payload
+
+        async def scenario():
+            service = GpuInferenceService(
+                decoder=_decode_fake,
+                processor=processor,
+                encoder=encoder,
+                preloader=lambda: None,
+                queue_capacity=3,
+                queue_timeout=1.0,
+                inference_timeout=1.0,
+                proxy_budget=3.0,
+            )
+
+            async def submit(index, payload):
+                results[index] = await service.infer(
+                    payload,
+                    "image/png",
+                    ModelName.FAST,
+                )
+
+            async with anyio.create_task_group() as service_tasks:
+                await service_tasks.start(service.run)
+                async with anyio.create_task_group() as jobs:
+                    jobs.start_soon(submit, 0, b"first")
+                    while not first_encode_started.is_set():
+                        await anyio.sleep(0.005)
+                    jobs.start_soon(submit, 1, b"second")
+                    while not second_encode_started.is_set():
+                        await anyio.sleep(0.005)
+                    jobs.start_soon(submit, 2, b"third")
+                    try:
+                        with anyio.move_on_after(0.05) as started_early:
+                            while not third_gpu_started.is_set():
+                                await anyio.sleep(0.005)
+                    finally:
+                        release_encoders.set()
+                    self.assertTrue(started_early.cancel_called)
+                    with anyio.fail_after(0.5):
+                        while not third_gpu_started.is_set():
+                            await anyio.sleep(0.005)
+                service_tasks.cancel_scope.cancel()
+
+            self.assertEqual(
+                [result.image_bytes for result in results],
+                [b"first", b"second", b"third"],
+            )
+
+        anyio.run(scenario)
+
     def test_response_timeout_does_not_release_gpu_slot_early(self):
         executions = []
         produced = []

@@ -86,9 +86,10 @@ response size.
 A bounded pipeline decodes uploads before GPU admission and encodes PNG output
 after inference. One GPU actor serializes only the model call across both
 models, so the next request can use the GPU while the previous result is being
-encoded. A full or expired queue returns `503` with `Retry-After`; an inference
-response deadline returns `504`. Queue waiting and model execution have
-separate deadlines whose sum stays below the reverse-proxy budget.
+encoded. Two result slots bound concurrent RGBA and PNG buffers without
+removing that overlap. A full or expired queue returns `503` with `Retry-After`;
+an inference response deadline returns `504`. Queue waiting and model execution
+have separate deadlines whose sum stays below the reverse-proxy budget.
 
 When the quality backend is enabled, startup warms both models before the API
 reports ready. This removes first-request latency and prevents a cold model load

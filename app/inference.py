@@ -16,6 +16,7 @@ DEFAULT_INFERENCE_TIMEOUT = 75.0
 DEFAULT_PROXY_BUDGET = 90.0
 MAX_IMAGE_PIXELS = 40_000_000
 PNG_COMPRESSION_LEVEL = 3
+ENCODE_CONCURRENCY = 2
 
 
 class InferenceQueueFullError(RuntimeError):
@@ -62,6 +63,8 @@ class _InferenceJob:
     cancelled: bool = False
     abandoned: bool = False
     admission_token: object = field(default_factory=object)
+    encode_token: object = field(default_factory=object)
+    encode_slot_acquired: bool = False
 
 
 def _positive_float(name: str, default: float) -> float:
@@ -174,6 +177,8 @@ class GpuInferenceService:
         self._send = None
         self._prepared_send = None
         self._admission = None
+        self._encode_limiter = None
+        self._waiting_for_result_slot = 0
         self._preparing = 0
         self._busy_model: ModelName | None = None
         self._started = False
@@ -230,7 +235,7 @@ class GpuInferenceService:
                         decoded_image.close()
                     self._preparing -= 1
 
-    async def _run_gpu_jobs(self, receive) -> None:
+    async def _run_gpu_jobs(self, receive, encode_limiter) -> None:
         async with receive:
             async for job in receive:
                 input_image = job.decoded_image
@@ -249,11 +254,23 @@ class GpuInferenceService:
                     job.done.set()
                     continue
 
-                job.started_at = time.monotonic()
-                self._busy_model = job.model
-                job.started.set()
                 result = None
                 try:
+                    self._waiting_for_result_slot += 1
+                    try:
+                        await encode_limiter.acquire_on_behalf_of(
+                            job.encode_token
+                        )
+                        job.encode_slot_acquired = True
+                    finally:
+                        self._waiting_for_result_slot -= 1
+
+                    if job.cancelled:
+                        continue
+
+                    job.started_at = time.monotonic()
+                    self._busy_model = job.model
+                    job.started.set()
                     result = await anyio.to_thread.run_sync(
                         self._processor,
                         input_image,
@@ -270,6 +287,9 @@ class GpuInferenceService:
                     if result is not None:
                         result.close()
                     input_image.close()
+                    if job.result is None and job.encode_slot_acquired:
+                        encode_limiter.release_on_behalf_of(job.encode_token)
+                        job.encode_slot_acquired = False
                     job.completed_at = time.monotonic()
                     self._busy_model = None
                     job.done.set()
@@ -290,6 +310,7 @@ class GpuInferenceService:
             self._send = send
             self._prepared_send = prepared_send
             self._admission = anyio.CapacityLimiter(self.queue_capacity + 1)
+            self._encode_limiter = anyio.CapacityLimiter(ENCODE_CONCURRENCY)
             self._started = True
 
             async with send:
@@ -302,6 +323,7 @@ class GpuInferenceService:
                     workers.start_soon(
                         self._run_gpu_jobs,
                         prepared_receive,
+                        self._encode_limiter,
                     )
                     task_status.started()
                     await anyio.sleep_forever()
@@ -309,6 +331,8 @@ class GpuInferenceService:
             self._started = False
             self._busy_model = None
             self._preparing = 0
+            self._waiting_for_result_slot = 0
+            self._encode_limiter = None
             self._admission = None
             self._prepared_send = None
             self._send = None
@@ -321,7 +345,13 @@ class GpuInferenceService:
     ) -> InferenceResult:
         send = self._send
         admission = self._admission
-        if not self._started or send is None or admission is None:
+        encode_limiter = self._encode_limiter
+        if (
+            not self._started
+            or send is None
+            or admission is None
+            or encode_limiter is None
+        ):
             raise RuntimeError("GPU inference service is not running.")
 
         job = _InferenceJob(
@@ -369,9 +399,6 @@ class GpuInferenceService:
                     ) from exc
             except anyio.get_cancelled_exc_class():
                 job.abandoned = True
-                if job.done.is_set() and job.result is not None:
-                    job.result.close()
-                    job.result = None
                 raise
 
             if job.error is not None:
@@ -394,6 +421,8 @@ class GpuInferenceService:
                 )
             finally:
                 result.close()
+                encode_limiter.release_on_behalf_of(job.encode_token)
+                job.encode_slot_acquired = False
             encode_ms = (time.monotonic() - encode_started_at) * 1000.0
 
             return InferenceResult(
@@ -405,12 +434,18 @@ class GpuInferenceService:
                 encode_ms=encode_ms,
             )
         finally:
+            if job.result is not None:
+                job.result.close()
+                job.result = None
+                if job.encode_slot_acquired:
+                    encode_limiter.release_on_behalf_of(job.encode_token)
+                    job.encode_slot_acquired = False
             admission.release_on_behalf_of(job.admission_token)
 
     def status(self) -> dict[str, object]:
         send = self._send
         prepared_send = self._prepared_send
-        queued = self._preparing
+        queued = self._preparing + self._waiting_for_result_slot
         if send is not None:
             queued += send.statistics().current_buffer_used
         if prepared_send is not None:
